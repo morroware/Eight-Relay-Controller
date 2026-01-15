@@ -94,6 +94,7 @@ The 8-Relay Control System is a comprehensive solution for controlling relay mod
   - View system statistics and logs
   - Real-time configuration updates
   - Audio file management and testing
+  - Scene and scheduling configuration via API (optional)
 
 - ✅ **System Integration**
   - Runs as systemd service with automatic startup
@@ -109,6 +110,7 @@ The 8-Relay Control System is a comprehensive solution for controlling relay mod
 - **GPIO Resource Management** - Proper initialization and cleanup
 - **Statistics Tracking** - Usage metrics and error counting
 - **API Endpoints** - RESTful API for integration
+- **Scenes and Scheduling** - Batch triggers, scene orchestration, and delayed actions
 - **Test Utilities** - Built-in GPIO and audio testing scripts
 
 ---
@@ -365,6 +367,38 @@ The system uses a JSON configuration file (`config.json`) for all settings.
 }
 ```
 
+### Scenes and Scheduling Configuration
+
+```json
+{
+    "scenes": {
+        "enabled": false,
+        "items": {
+            "evening_routine": {
+                "description": "Turn on key relays in sequence",
+                "delay_between": 0.25,
+                "actions": [
+                    {"relay": 1, "duration": 0.5},
+                    {"relay": 2, "duration": 1.0},
+                    {"relay": 7, "duration": 0.5}
+                ]
+            }
+        }
+    },
+    "scheduling": {
+        "enabled": true,
+        "max_jobs": 20,
+        "max_delay_seconds": 86400
+    },
+    "api_controls": {
+        "allow_duration_override": true,
+        "max_override_seconds": 60,
+        "allow_relay_cancel": true,
+        "allow_scene_trigger": true
+    }
+}
+```
+
 ---
 
 ## Usage
@@ -448,6 +482,32 @@ Response:
 }
 ```
 
+**Pulse Relay with Custom Duration**
+```http
+POST /relay/{relay_number}/pulse
+Content-Type: application/json
+
+{"duration": 1.5}
+```
+
+**Cancel Active Relay**
+```http
+POST /relay/{relay_number}/cancel
+```
+
+**Batch Trigger Relays**
+```http
+POST /relays/batch
+Content-Type: application/json
+
+{
+  "relays": [
+    {"relay": 1, "duration": 0.5, "delay": 0},
+    {"relay": 2, "duration": 1.0, "delay": 0.25}
+  ]
+}
+```
+
 ### Audio Playback
 
 **Play Audio**
@@ -492,6 +552,41 @@ Response:
 **Health Check**
 ```http
 GET /health
+```
+
+**System Metrics**
+```http
+GET /metrics
+```
+
+### Scenes and Scheduling
+
+**List Scenes**
+```http
+GET /scenes
+```
+
+**Trigger Scene**
+```http
+POST /scene/{scene_name}
+```
+
+**Schedule Relay or Scene**
+```http
+POST /schedule
+Content-Type: application/json
+
+{"type": "relay", "relay": 1, "delay": 60, "duration": 0.5}
+```
+
+**List Scheduled Jobs**
+```http
+GET /schedule
+```
+
+**Cancel Scheduled Job**
+```http
+DELETE /schedule/{job_id}
 ```
 
 ### Admin Endpoints

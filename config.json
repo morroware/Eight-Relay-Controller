@@ -134,5 +134,20 @@
         "max_size_mb": 10,
         "backup_count": 5,
         "log_level": "INFO"
+    },
+    "scenes": {
+        "enabled": false,
+        "items": {}
+    },
+    "scheduling": {
+        "enabled": true,
+        "max_jobs": 20,
+        "max_delay_seconds": 86400
+    },
+    "api_controls": {
+        "allow_duration_override": true,
+        "max_override_seconds": 60,
+        "allow_relay_cancel": true,
+        "allow_scene_trigger": true
     }
 }
