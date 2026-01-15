@@ -37,11 +37,14 @@ import time
 import threading
 import signal
 import atexit
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import subprocess
 import pygame
+import platform
+import shutil
+from uuid import uuid4
 
 # Configuration Management
 class Config:
@@ -176,6 +179,21 @@ class Config:
             "max_size_mb": 10,
             "backup_count": 5,
             "log_level": "INFO"
+        },
+        "scenes": {
+            "enabled": False,
+            "items": {}
+        },
+        "scheduling": {
+            "enabled": True,
+            "max_jobs": 20,
+            "max_delay_seconds": 86400
+        },
+        "api_controls": {
+            "allow_duration_override": True,
+            "max_override_seconds": 60,
+            "allow_relay_cancel": True,
+            "allow_scene_trigger": True
         }
     }
 
@@ -423,6 +441,54 @@ class Config:
         """Get logging level."""
         return self.config["logging"]["log_level"]
 
+    # Scene configuration
+    @property
+    def SCENES_ENABLED(self):
+        """Check if scene triggering is enabled."""
+        return self.config.get("scenes", {}).get("enabled", False)
+
+    @property
+    def SCENES(self):
+        """Get configured scenes."""
+        return self.config.get("scenes", {}).get("items", {})
+
+    # Scheduling configuration
+    @property
+    def SCHEDULING_ENABLED(self):
+        """Check if scheduling is enabled."""
+        return self.config.get("scheduling", {}).get("enabled", False)
+
+    @property
+    def SCHEDULING_MAX_JOBS(self):
+        """Get maximum scheduled jobs allowed."""
+        return self.config.get("scheduling", {}).get("max_jobs", 20)
+
+    @property
+    def SCHEDULING_MAX_DELAY(self):
+        """Get maximum delay allowed for schedules."""
+        return self.config.get("scheduling", {}).get("max_delay_seconds", 86400)
+
+    # API controls
+    @property
+    def API_ALLOW_DURATION_OVERRIDE(self):
+        """Check if API duration overrides are allowed."""
+        return self.config.get("api_controls", {}).get("allow_duration_override", False)
+
+    @property
+    def API_MAX_OVERRIDE_SECONDS(self):
+        """Get maximum duration override for API requests."""
+        return self.config.get("api_controls", {}).get("max_override_seconds", 60)
+
+    @property
+    def API_ALLOW_RELAY_CANCEL(self):
+        """Check if relay cancellation via API is allowed."""
+        return self.config.get("api_controls", {}).get("allow_relay_cancel", False)
+
+    @property
+    def API_ALLOW_SCENE_TRIGGER(self):
+        """Check if scene triggering via API is allowed."""
+        return self.config.get("api_controls", {}).get("allow_scene_trigger", False)
+
 
 # Audio Utility Functions
 def validate_audio_file(filepath):
@@ -455,6 +521,178 @@ def validate_audio_file(filepath):
     except Exception as e:
         app.logger.error(f"Cannot read audio file {filepath}: {e}")
         return False
+
+
+def get_cpu_temperature():
+    """Get CPU temperature in Celsius if available."""
+    try:
+        temp_path = Path("/sys/class/thermal/thermal_zone0/temp")
+        if temp_path.exists():
+            return round(int(temp_path.read_text().strip()) / 1000.0, 1)
+    except Exception as e:
+        app.logger.debug(f"Unable to read CPU temperature: {e}")
+    return None
+
+
+def get_memory_info():
+    """Get basic memory usage information from /proc/meminfo."""
+    meminfo = {}
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                key, value = line.split(":", 1)
+                meminfo[key.strip()] = value.strip()
+        total_kb = int(meminfo.get("MemTotal", "0 kB").split()[0])
+        free_kb = int(meminfo.get("MemAvailable", "0 kB").split()[0])
+        used_kb = max(total_kb - free_kb, 0)
+        return {
+            "total_kb": total_kb,
+            "available_kb": free_kb,
+            "used_kb": used_kb,
+            "used_percent": round((used_kb / total_kb) * 100, 1) if total_kb else None
+        }
+    except Exception as e:
+        app.logger.debug(f"Unable to read memory info: {e}")
+    return None
+
+
+def get_disk_usage(path="/"):
+    """Get disk usage statistics for the given path."""
+    try:
+        usage = shutil.disk_usage(path)
+        used_percent = round((usage.used / usage.total) * 100, 1) if usage.total else None
+        return {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "used_percent": used_percent
+        }
+    except Exception as e:
+        app.logger.debug(f"Unable to read disk usage for {path}: {e}")
+    return None
+
+
+def get_load_average():
+    """Get system load averages if supported."""
+    try:
+        if hasattr(os, "getloadavg"):
+            load1, load5, load15 = os.getloadavg()
+            return {"load1": load1, "load5": load5, "load15": load15}
+    except Exception as e:
+        app.logger.debug(f"Unable to read load average: {e}")
+    return None
+
+
+def build_system_metrics():
+    """Assemble system metrics payload."""
+    return {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "cpu_temperature_c": get_cpu_temperature(),
+        "memory": get_memory_info(),
+        "disk": get_disk_usage(),
+        "load_average": get_load_average()
+    }
+
+
+def normalize_duration(value):
+    """Normalize a provided duration value to a float if possible."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_relay_number(value):
+    """Normalize relay number to int and ensure it exists."""
+    try:
+        relay_num = int(value)
+    except (TypeError, ValueError):
+        return None
+    return relay_num if relay_num in config.RELAY_PINS else None
+
+
+def validate_duration_override(duration):
+    """Validate a duration override against config limits."""
+    duration_value = normalize_duration(duration)
+    if duration_value is None or duration_value <= 0:
+        return None, "Duration must be a positive number"
+    if not config.API_ALLOW_DURATION_OVERRIDE:
+        return None, "Duration override is disabled"
+    max_override = config.API_MAX_OVERRIDE_SECONDS
+    if max_override and duration_value > max_override:
+        return None, f"Duration exceeds max override of {max_override}s"
+    return duration_value, None
+
+
+def schedule_job(action, delay_seconds, meta):
+    """Schedule an action to run after a delay."""
+    if not config.SCHEDULING_ENABLED:
+        return None, "Scheduling is disabled"
+    delay_value = normalize_duration(delay_seconds)
+    if delay_value is None or delay_value < 0:
+        return None, "Delay must be a non-negative number"
+    if delay_value > config.SCHEDULING_MAX_DELAY:
+        return None, f"Delay exceeds max of {config.SCHEDULING_MAX_DELAY}s"
+    with scheduled_jobs_lock:
+        if len(scheduled_jobs) >= config.SCHEDULING_MAX_JOBS:
+            return None, "Maximum scheduled jobs reached"
+        job_id = uuid4().hex
+        run_at = datetime.now() + timedelta(seconds=delay_value)
+
+        def _execute():
+            with scheduled_jobs_lock:
+                job = scheduled_jobs.get(job_id, {})
+                job["status"] = "running"
+                scheduled_jobs[job_id] = job
+            try:
+                action()
+                status = "completed"
+            except Exception as e:
+                app.logger.error(f"Scheduled job {job_id} failed: {e}")
+                status = "failed"
+            with scheduled_jobs_lock:
+                job = scheduled_jobs.get(job_id, {})
+                job["status"] = status
+                scheduled_jobs[job_id] = job
+
+        timer = threading.Timer(delay_value, _execute)
+        scheduled_jobs[job_id] = {
+            "id": job_id,
+            "created_at": datetime.now().isoformat(),
+            "run_at": run_at.isoformat(),
+            "status": "scheduled",
+            **meta,
+            "timer": timer
+        }
+        timer.daemon = True
+        timer.start()
+    return job_id, None
+
+
+def cancel_scheduled_job(job_id):
+    """Cancel a scheduled job if it exists."""
+    with scheduled_jobs_lock:
+        job = scheduled_jobs.get(job_id)
+        if not job:
+            return False, "Job not found"
+        timer = job.get("timer")
+        if timer:
+            timer.cancel()
+        job["status"] = "cancelled"
+        scheduled_jobs[job_id] = job
+    return True, None
+
+
+def list_scheduled_jobs():
+    """Return a list of scheduled jobs without timer objects."""
+    with scheduled_jobs_lock:
+        jobs = []
+        for job in scheduled_jobs.values():
+            filtered = {k: v for k, v in job.items() if k != "timer"}
+            jobs.append(filtered)
+    return jobs
 
 
 # Audio Player Class
@@ -861,6 +1099,8 @@ audio_button7_handler = None
 
 stats_lock = threading.Lock()
 initialized_pins = []  # Track initialized pins for cleanup
+scheduled_jobs = {}
+scheduled_jobs_lock = threading.Lock()
 
 # Statistics tracking
 stats = {
@@ -1114,7 +1354,7 @@ def cleanup_partial_gpio(handlers_to_cleanup):
         app.logger.error(f"Error in final GPIO cleanup: {e}")
 
 
-def trigger_relay(relay_num):
+def trigger_relay(relay_num, duration_override=None):
     """
     Trigger a relay for its configured duration, can be interrupted.
     
@@ -1149,7 +1389,7 @@ def trigger_relay(relay_num):
             app.logger.warning(f"Relay {relay_num} is already active")
             return
 
-        duration = config.RELAY_TRIGGER_DURATIONS.get(relay_num, 0.5)
+        duration = duration_override if duration_override is not None else config.RELAY_TRIGGER_DURATIONS.get(relay_num, 0.5)
         on_state = GPIO.LOW if config.RELAY_ACTIVE_LOW else GPIO.HIGH
 
         # Clear any previous reset event for this relay before starting
@@ -1186,6 +1426,51 @@ def trigger_relay(relay_num):
         with active_triggers_lock:
             if active_triggers > 0:
                 active_triggers -= 1
+
+
+def trigger_scene(scene_name):
+    """
+    Trigger a scene consisting of multiple relay actions.
+    
+    Args:
+        scene_name (str): Name of the scene to trigger
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    if not config.SCENES_ENABLED or not config.API_ALLOW_SCENE_TRIGGER:
+        return False, "Scene triggering is disabled"
+
+    scenes = config.SCENES
+    scene = scenes.get(scene_name)
+    if not scene:
+        return False, "Scene not found"
+
+    actions = scene.get("actions", [])
+    if not actions:
+        return False, "Scene has no actions configured"
+
+    delay_between = normalize_duration(scene.get("delay_between"))
+    delay_between = delay_between if delay_between is not None and delay_between >= 0 else 0
+
+    def _run_scene():
+        for index, action in enumerate(actions):
+            relay_num = normalize_relay_number(action.get("relay"))
+            if relay_num is None:
+                continue
+
+            action_delay = normalize_duration(action.get("delay"))
+            if action_delay is None:
+                action_delay = delay_between if index > 0 else 0
+            if action_delay and action_delay > 0:
+                time.sleep(action_delay)
+
+            duration = normalize_duration(action.get("duration"))
+            trigger_relay(relay_num, duration_override=duration)
+
+    scene_thread = threading.Thread(target=_run_scene, daemon=True)
+    scene_thread.start()
+    return True, f"Scene '{scene_name}' triggered"
 
 
 # Flask Routes
@@ -1243,6 +1528,93 @@ def control_relay(relay_num):
     return jsonify({'status': 'success', 'relay': relay_num, 'duration': duration})
 
 
+@app.route('/relay/<int:relay_num>/pulse', methods=['POST'])
+def pulse_relay(relay_num):
+    """
+    Trigger a relay with an optional duration override.
+    
+    JSON body:
+        {"duration": 1.5}
+    """
+    if relay_num < 1 or relay_num > len(config.RELAY_PINS):
+        return jsonify({'status': 'error', 'message': 'Invalid relay number'}), 400
+
+    data = request.json or {}
+    duration_override, error = validate_duration_override(data.get("duration"))
+    if error:
+        return jsonify({'status': 'error', 'message': error}), 400
+
+    t = threading.Thread(
+        target=trigger_relay,
+        args=(relay_num, duration_override),
+        name=f"relay-{relay_num}-pulse-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    )
+    t.daemon = True
+    t.start()
+
+    return jsonify({'status': 'success', 'relay': relay_num, 'duration': duration_override})
+
+
+@app.route('/relay/<int:relay_num>/cancel', methods=['POST'])
+def cancel_relay(relay_num):
+    """
+    Cancel an active relay trigger.
+    """
+    if not config.API_ALLOW_RELAY_CANCEL:
+        return jsonify({'status': 'error', 'message': 'Relay cancellation is disabled'}), 403
+
+    if relay_num < 1 or relay_num > len(config.RELAY_PINS):
+        return jsonify({'status': 'error', 'message': 'Invalid relay number'}), 400
+
+    relay_reset_events[relay_num].set()
+    return jsonify({'status': 'success', 'message': f'Relay {relay_num} cancellation requested'})
+
+
+@app.route('/relays/batch', methods=['POST'])
+def batch_relay_trigger():
+    """
+    Trigger multiple relays with optional delays and duration overrides.
+    
+    JSON body:
+        {"relays": [{"relay": 1, "duration": 1.0, "delay": 0.2}]}
+    """
+    data = request.json or {}
+    items = data.get("relays", [])
+    if not items:
+        return jsonify({'status': 'error', 'message': 'No relays provided'}), 400
+
+    results = []
+
+    def _trigger_with_delay(relay_num, duration, delay):
+        if delay and delay > 0:
+            time.sleep(delay)
+        trigger_relay(relay_num, duration_override=duration)
+
+    for item in items:
+        relay_num = normalize_relay_number(item.get("relay"))
+        if relay_num is None:
+            results.append({"relay": None, "status": "error", "message": "Invalid relay number"})
+            continue
+
+        delay = normalize_duration(item.get("delay")) or 0
+        duration = None
+        if item.get("duration") is not None:
+            duration, error = validate_duration_override(item.get("duration"))
+            if error:
+                results.append({"relay": relay_num, "status": "error", "message": error})
+                continue
+
+        t = threading.Thread(
+            target=_trigger_with_delay,
+            args=(relay_num, duration, delay),
+            daemon=True
+        )
+        t.start()
+        results.append({"relay": relay_num, "status": "scheduled", "delay": delay, "duration": duration})
+
+    return jsonify({'status': 'success', 'results': results})
+
+
 @app.route('/audio/play/<int:button_num>', methods=['POST'])
 def play_audio(button_num):
     """
@@ -1296,6 +1668,88 @@ def play_audio(button_num):
         return jsonify({'status': 'error', 'message': 'Audio system not initialized'}), 500
 
 
+@app.route('/scenes', methods=['GET'])
+def list_scenes():
+    """List configured scenes."""
+    scenes = config.SCENES
+    response = {
+        name: {
+            "description": details.get("description", ""),
+            "actions": details.get("actions", [])
+        }
+        for name, details in scenes.items()
+    }
+    return jsonify({"enabled": config.SCENES_ENABLED, "scenes": response})
+
+
+@app.route('/scene/<string:scene_name>', methods=['POST'])
+def run_scene(scene_name):
+    """Trigger a named scene."""
+    success, message = trigger_scene(scene_name)
+    if success:
+        return jsonify({'status': 'success', 'message': message})
+    return jsonify({'status': 'error', 'message': message}), 400
+
+
+@app.route('/schedule', methods=['GET', 'POST'])
+def manage_schedule():
+    """
+    Manage scheduled relay or scene actions.
+    
+    POST JSON body:
+        {"type": "relay", "relay": 1, "delay": 60, "duration": 1.0}
+        {"type": "scene", "scene": "evening", "delay": 120}
+    """
+    if request.method == 'GET':
+        return jsonify({'scheduled_jobs': list_scheduled_jobs()})
+
+    data = request.json or {}
+    schedule_type = data.get("type")
+    delay = data.get("delay", 0)
+
+    if schedule_type == "relay":
+        relay_num = normalize_relay_number(data.get("relay"))
+        if relay_num is None:
+            return jsonify({'status': 'error', 'message': 'Missing relay number'}), 400
+
+        duration = None
+        if data.get("duration") is not None:
+            duration, error = validate_duration_override(data.get("duration"))
+            if error:
+                return jsonify({'status': 'error', 'message': error}), 400
+
+        job_id, error = schedule_job(
+            action=lambda: trigger_relay(relay_num, duration_override=duration),
+            delay_seconds=delay,
+            meta={"type": "relay", "relay": relay_num, "duration": duration}
+        )
+    elif schedule_type == "scene":
+        scene_name = data.get("scene")
+        if not scene_name:
+            return jsonify({'status': 'error', 'message': 'Missing scene name'}), 400
+        job_id, error = schedule_job(
+            action=lambda: trigger_scene(scene_name),
+            delay_seconds=delay,
+            meta={"type": "scene", "scene": scene_name}
+        )
+    else:
+        return jsonify({'status': 'error', 'message': 'Invalid schedule type'}), 400
+
+    if error:
+        return jsonify({'status': 'error', 'message': error}), 400
+
+    return jsonify({'status': 'success', 'job_id': job_id})
+
+
+@app.route('/schedule/<string:job_id>', methods=['DELETE'])
+def cancel_schedule(job_id):
+    """Cancel a scheduled job."""
+    success, error = cancel_scheduled_job(job_id)
+    if success:
+        return jsonify({'status': 'success', 'message': 'Job cancelled'})
+    return jsonify({'status': 'error', 'message': error}), 404
+
+
 @app.route('/status')
 def get_status():
     """
@@ -1319,10 +1773,13 @@ def get_status():
                 'multi_button_enabled': config.MULTI_BUTTON_ENABLED,
                 'button_count': len(button_handlers) if config.MULTI_BUTTON_ENABLED else (1 if config.BUTTON_ENABLED else 0),
                 'audio_enabled': config.AUDIO_BUTTONS_ENABLED,
-                'audio_system_ready': audio_player.initialized if audio_player else False
+                'audio_system_ready': audio_player.initialized if audio_player else False,
+                'scenes_enabled': config.SCENES_ENABLED,
+                'scheduled_jobs': len(list_scheduled_jobs())
             },
             'audio_buttons': {},
-            'physical_buttons': {}
+            'physical_buttons': {},
+            'system_metrics': build_system_metrics()
         }
         
         # Relay status
@@ -1375,6 +1832,23 @@ def get_status():
     except Exception as e:
         app.logger.error(f"Error getting status: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/metrics')
+def metrics():
+    """Return system metrics and usage stats for monitoring."""
+    uptime = datetime.now() - stats['start_time']
+    payload = {
+        'uptime': str(uptime).split('.')[0],
+        'total_triggers': stats['total_triggers'],
+        'relay_triggers': stats['relay_triggers'],
+        'audio_plays': stats['audio_plays'],
+        'errors': stats['errors'],
+        'active_triggers': active_triggers,
+        'scheduled_jobs': len(list_scheduled_jobs()),
+        'system_metrics': build_system_metrics()
+    }
+    return jsonify(payload)
 
 
 @app.route('/health')
@@ -1446,7 +1920,8 @@ def admin_stats():
         'errors': stats['errors'],
         'active_triggers': active_triggers,
         'gpio_pins_initialized': len(initialized_pins),
-        'physical_buttons_active': len(button_handlers) if config.MULTI_BUTTON_ENABLED else (1 if button_handler else 0)
+        'physical_buttons_active': len(button_handlers) if config.MULTI_BUTTON_ENABLED else (1 if button_handler else 0),
+        'scheduled_jobs': len(list_scheduled_jobs())
     })
 
 
